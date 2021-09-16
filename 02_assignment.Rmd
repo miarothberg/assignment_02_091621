@@ -1,0 +1,359 @@
+---
+title: 'Assignment #2'
+author: "Mia Rothberg"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r libraries}
+library(tidyverse)         # for graphing and data cleaning
+library(tidymodels)        # for modeling
+library(naniar)            # for analyzing missing values
+library(vip)               # for variable importance plots
+theme_set(theme_minimal()) # Lisa's favorite theme
+```
+
+```{r data}
+hotels <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-02-11/hotels.csv')
+```
+
+
+When you finish the assignment, remove the `#` from the options chunk at the top, so that messages and warnings aren't printed. If you are getting errors in your code, add `error = TRUE` so that the file knits. I would recommend not removing the `#` until you are completely finished.
+
+## Put it on GitHub!        
+
+From now on, GitHub should be part of your routine when doing assignments. I recommend making it part of your process anytime you are working in R, but I'll make you show it's part of your process for assignments.
+
+**Task**: When you are finished with the assignment, post a link below to the GitHub repo for the assignment.
+
+[Github link](https://github.com/miarothberg/assignment_02_091621)
+
+## Machine Learning review and intro to `tidymodels`
+
+Read through and follow along with the [Machine Learning review with an intro to the `tidymodels` package](https://advanced-ds-in-r.netlify.app/posts/2021-03-16-ml-review/) posted on the Course Materials page. 
+
+**Tasks**:
+
+1. Read about the hotel booking data, `hotels`, on the [Tidy Tuesday page](https://github.com/rfordatascience/tidytuesday/blob/master/data/2020/2020-02-11/readme.md) it came from. There is also a link to an article from the original authors. The outcome we will be predicting is called `is_canceled`. 
+  - Without doing any analysis, what are some variables you think might be predictive and why? 
+  
+  * previous_cancellations and previous_bookings_not_canceled would indicate any patterns if a person cancels frequently
+  * lead_time - if people book farther in advance, their plans are more likely to change
+  * children and babies - both make people more likely to cancel due to illness
+  
+  _ What are some problems that might exist with the data? You might think about how it was collected and who did the collecting.  
+  
+  >The dataset only looks at two different hotels, with significantly more reservations at the city hotel than the resort hotel.
+  
+  - If we construct a model, what type of conclusions will be able to draw from it?  
+  
+  >how likely someone is to cancel their booking based on the predictor variables.
+  
+2. Create some exploratory plots or table summaries of the variables in the dataset. Be sure to also examine missing values or other interesting values. You may want to adjust the `fig.width` and `fig.height` in the code chunk options.  
+
+```{r expl_quant}
+hotels %>% 
+  select(where(is.numeric)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "variable", 
+               values_to = "value") %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(vars(variable), 
+             scales = "free")
+```
+
+> Many of the quantitative variables are right skewed or have large outlier values, especially adults, average daily rate (adr), previous_cancellations, and bookings_not_cancelled. Those that are right skewed should possibly be log transformed. There are also several binary variables being read as quantitative here, which need to be kept in mind.
+
+```{r expl_cat, fig.width=8, fig.height=8}
+hotels %>% 
+  select(where(is.character)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "variable", 
+               values_to = "value") %>% 
+  ggplot(aes(x = value)) +
+  geom_bar() +
+  facet_wrap(vars(variable), 
+             scales = "free", 
+             nrow = 2)
+```
+> Notably, about a third of the bookings were cancelled. 2/3 of the data came from the city hotel.
+
+3. First, we will do a couple things to get the data ready. 
+
+* I did the following for you: made outcome a factor (needs to be that way for logistic regression), made all character variables factors, removed the year variable and some reservation status variables, and removed cases with missing values (not NULLs but true missing values).
+
+* You need to split the data into a training and test set, stratifying on the outcome variable, `is_canceled`. Since we have a lot of data, split the data 50/50 between training and test. I have already `set.seed()` for you. Be sure to use `hotels_mod` in the splitting.
+
+```{r}
+hotels_mod <- hotels %>% 
+  mutate(is_canceled = as.factor(is_canceled)) %>% 
+  mutate(across(where(is.character), as.factor)) %>% 
+  select(-arrival_date_year,
+         -reservation_status,
+         -reservation_status_date) %>% 
+  add_n_miss() %>% 
+  filter(n_miss_all == 0) %>% 
+  select(-n_miss_all)
+
+set.seed(494)
+
+# Assign 50% of data to training
+hotels_mod_split <- initial_split(hotels_mod, 
+                             prop = 0.5,
+                             strata = is_canceled)
+hotels_training <- training(hotels_mod_split)
+hotels_testing <- testing(hotels_mod_split)
+```
+
+4. In this next step, we are going to do the pre-processing. Usually, I won't tell you exactly what to do here, but for your first exercise, I'll tell you the steps. 
+
+* Set up the recipe with `is_canceled` as the outcome and all other variables as predictors (HINT: `~.`).  
+* Use a `step_XXX()` function or functions (I think there are other ways to do this, but I found `step_mutate_at()` easiest) to create some indicator variables for the following variables: `children`, `babies`, and `previous_cancellations`. So, the new variable should be a 1 if the original is more than 0 and 0 otherwise. Make sure you do this in a way that accounts for values that may be larger than any we see in the dataset.  
+* For the `agent` and `company` variables, make new indicator variables that are 1 if they have a value of `NULL` and 0 otherwise. I also used `step_mutate_at()` for this, but there's more ways you could do it.
+* Use `fct_lump_n()` inside `step_mutate()` to lump together countries that aren't in the top 5 most occurring. 
+* If you used new names for some of the new variables you created, then remove any variables that are no longer needed. 
+* Use `step_normalize()` to center and scale all the non-categorical predictor variables. (Do this BEFORE creating dummy variables. When I tried to do it after, I ran into an error - I'm still [investigating](https://community.rstudio.com/t/tidymodels-see-notes-error-but-only-with-step-xxx-functions-in-a-certain-order/115006) why.)
+* Create dummy variables for all factors/categorical predictor variables (make sure you have `-all_outcomes()` in this part!!).  
+* Use the `prep()` and `juice()` functions to apply the steps to the training data just to check that everything went as planned.
+
+```{r recipe}
+
+hotels_recipe <- recipe(is_canceled ~ ., #short-cut, . = all other vars
+                       data = hotels_training) %>% 
+  # Pre-processing:
+  #add indicator variables
+  step_mutate(children_indicator = ifelse(children > 0, 1, 0),
+              babies_indicator = ifelse(babies > 0, 1, 0),
+              previous_cancellations_indicator = ifelse(previous_cancellations > 0, 1, 0)) %>% 
+  step_mutate(agent_indicator = ifelse(agent == "NULL", 1, 0),
+              company_indicator = ifelse(company == "NULL", 1, 0)) %>% 
+  
+  #lump together countries that aren't in the top 5
+  step_mutate(country = fct_lump_n(country, 5, w = NULL, other_level = "OTHER")) %>% 
+  
+  step_rm(children, babies, previous_cancellations, agent, company) %>%  #needs to be before step_normalize or next code chunk won't work
+  
+  #use step_normalize
+  step_normalize(all_predictors(), 
+                 -all_nominal()) %>% 
+  
+  #create dummy variables
+  step_dummy(all_nominal(), 
+             -all_outcomes())
+  
+  
+```
+
+
+```{r test_recipe}
+hotels_recipe %>% 
+  prep(hotels_training) %>%
+  juice() 
+```
+
+
+5. In this step we will set up a LASSO model and workflow.
+
+* In general, why would we want to use LASSO instead of regular logistic regression? (HINT: think about what happens to the coefficients).  
+
+> LASSO models rein in runaway coefficients and standardize all variables to be on a scal with a mean of 0 and standard deviation of 1 while weaning out bad predictors.
+
+* Define the model type, set the engine, set the `penalty` argument to `tune()` as a placeholder, and set the mode.  
+
+```{r lasso_mod}
+hotels_lasso_mod <- 
+  # Define a lasso model 
+  logistic_reg(mixture = 1) %>% 
+  # Set the engine to "glmnet" 
+  set_engine("glmnet") %>% 
+  # The parameters we will tune.
+  set_args(penalty = tune()) %>% 
+  set_mode("classification")
+```
+
+* Create a workflow with the recipe and model.  
+```{r}
+hotels_lasso_wf <- 
+  # Set up the workflow
+  workflow() %>% 
+  # Add the recipe
+  add_recipe(hotels_recipe) %>% 
+  # Add the modeling
+  add_model(hotels_lasso_mod)
+
+hotels_lasso_wf
+```
+
+
+
+6. In this step, we'll tune the model and fit the model using the best tuning parameter to the entire training dataset.
+
+* Create a 5-fold cross-validation sample. We'll use this later. I have set the seed for you.  
+* Use the `grid_regular()` function to create a grid of 10 potential penalty parameters (we're keeping this sort of small because the dataset is pretty large). Use that with the 5-fold cv data to tune the model.  
+* Use the `tune_grid()` function to fit the models with different tuning parameters to the different cross-validation sets.  
+* Use the `collect_metrics()` function to collect all the metrics from the previous step and create a plot with the accuracy on the y-axis and the penalty term on the x-axis. Put the x-axis on the log scale.  
+* Use the `select_best()` function to find the best tuning parameter, fit the model using that tuning parameter to the entire training set (HINT: `finalize_workflow()` and `fit()`), and display the model results using `pull_workflow_fit()` and `tidy()`. Are there some variables with coefficients of 0?
+
+```{r}
+set.seed(494) # for reproducibility
+
+#cross-validation sample
+hotels_cv <- vfold_cv(hotels_training, v = 5)
+```
+
+```{r}
+#penalty parameters
+penalty_grid <- grid_regular(penalty(),
+                             levels = 10)
+
+#tune_grid()
+hotels_lasso_tune <- 
+  hotels_lasso_wf %>% 
+  tune_grid(
+    resamples = hotels_cv,
+    grid = penalty_grid
+    )
+```
+
+```{r}
+#collect_metrics()
+collect_metrics(hotels_lasso_tune)
+
+#make a plot
+hotels_lasso_tune %>% 
+  collect_metrics() %>% 
+  filter(.metric == "accuracy") %>% 
+  ggplot(aes(x = penalty, y = mean)) +
+  geom_point() +
+  geom_line() +
+  scale_x_log10(
+   breaks = scales::trans_breaks("log10", function(x) 10^x),
+   labels = scales::trans_format("log10",scales::math_format(10^.x))) +
+  labs(x = "penalty (log)", y = "accuracy")
+```
+
+```{r tune}
+#select_best()
+best_param <- hotels_lasso_tune %>% 
+  select_best(metric = "accuracy")
+
+#Create final workflow
+hotels_lasso_final_wf <- hotels_lasso_wf %>% 
+  finalize_workflow(best_param)
+```
+
+```{r lasso_train}
+hotels_lasso_final_mod <- hotels_lasso_final_wf %>% 
+  fit(data = hotels_training)
+
+hotels_lasso_final_mod %>% 
+  pull_workflow_fit() %>% 
+  tidy() 
+```
+
+> Arrival_date_month_February, market_segment_Groups, distribution_channel_Undefined, and assigned_room_type_L each have a coefficient of 0.
+
+
+7. Now that we have a model, let's evaluate it a bit more. All we have looked at so far is the cross-validated accuracy from the previous step. 
+
+* Create a variable importance graph. Which variables show up as the most important? Are you surprised?  
+
+> In general, reserved and assigned room types appear to be among the most important variables (which I was not expecting). The deposit being non-refundable is the second most important, which is expected. For some reason, the tenth most important variable is if the guests are from Portugal, which is also surprising.
+
+```{r vip}
+# Visualize variable importance
+hotels_lasso_final_mod %>% 
+  pull_workflow_fit() %>% 
+  vip()
+```
+
+
+* Use the `last_fit()` function to fit the final model and then apply it to the testing data. Report the metrics from the testing data using the `collect_metrics()` function. How do they compare to the cross-validated metrics?
+
+> They are very similar to the cross-validated metrics - these metrics are each about 0.002 lower than the estimates from the cross-validated metrics.
+
+```{r}
+hotels_lasso_test <- hotels_lasso_final_wf %>% 
+  last_fit(hotels_mod_split)
+
+hotels_lasso_test %>% 
+  collect_metrics()
+```
+```{r}
+#cross-validated metrics for comparison
+collect_metrics(hotels_lasso_tune) %>% 
+  head(2)
+```
+
+
+* Use the `collect_predictions()` function to find the predicted probabilities and classes for the test data. Save this to a new dataset called `preds`. Then, use the `conf_mat()` function from `dials` (part of `tidymodels`) to create a confusion matrix showing the predicted classes vs. the true classes. Compute the true positive rate (sensitivity), true negative rate (specificity), and accuracy. See this [Wikipedia](https://en.wikipedia.org/wiki/Confusion_matrix) reference if you (like me) tend to forget these definitions. Also keep in mind that a "positive" in this case is a cancellation (those are the 1's).    
+
+
+```{r}
+preds <-
+  collect_predictions(hotels_lasso_test)
+
+
+preds %>% 
+  conf_mat(truth = is_canceled, estimate = .pred_class)
+```
+
+> Sensitivity (true positive rate) = true positive/(true positive + false negative) = 14,333/(14,333+7777) = 0.6482587 = 64.83%
+
+> Specificity (true negative rate) = true negative/(true negative + false positive) = 34,179/(34,179+3404) = 0.9094271 = 90.94%
+
+> Accuracy = (true positive + true negative)/total = 0.8126916 = 81.27%
+
+* Use the `preds` dataset you just created to create a density plot of the predicted probabilities of canceling (the variable is called `.pred_1`), filling by `is_canceled`. Use an `alpha = .5` and `color = NA` in the `geom_density()`.
+
+```{r}
+preds %>% 
+  ggplot(aes(x = .pred_1, fill = is_canceled)) +
+  geom_density(alpha = .5, color = NA) +
+  labs(x = "predicted probabilities of cancelling")
+```
+
+
+Answer these questions: 
+a. What would this graph look like for a model with an accuracy that was close to 1?  
+
+> A model with an accuracy close to 1 would have the reds (not cancelled) be very dense at 0 (0% probability of cancelled) and less dense elsewhere. The blues would be very dense at 1 and less dense elsewhere. The tails of both would stop near 0.5 (or whatever the threshold was set for)
+
+b. Our predictions are classified as canceled if their predicted probability of canceling is greater than .5. If we wanted to have a high true positive rate, should we make the cutoff for predicted as canceled higher or lower than .5?
+
+> We should make it lower than 0.5 to capture more of the cancelled visits.
+
+c. What happens to the true negative rate if we try to get a higher true positive rate? 
+
+> The true negative rate would decrease.
+
+8. Let's say that this model is going to be applied to bookings 14 days in advance of their arrival at each hotel, and someone who works for the hotel will make a phone call to the person who made the booking. During this phone call, they will try to ensure that the person will be keeping their reservation or that they will be canceling in which case they can do that now and still have time to fill the room. How should the hotel go about deciding who to call? How could they measure whether it was worth the effort to do the calling? Can you think of another way they might use the model? 
+
+> The hotel could use the model to identify and call people with a predicted probability of cancelling above a certain threshold (say, 0.5). To measure whether it was worth the effort to do the calling, the hotel could keep track of the rate of people called that cancelled vs the rate of people who were not called who ended up cancelling. It's also worth considering that the phone call may be a reminder to people who somehow forgot about their reservation, so the model should be reworked with the new data overtime. Although I think it would be inappropriate and likely illegal, the model could be used to set the deposit amount on a sliding scale. Those who are more likely to cancel could be asked to pay a higher deposit, decreasing the likelihood that they will cancel and decreasing the hotel's losses if they do. 
+
+9. How might you go about questioning and evaluating the model in terms of fairness? Are there any questions you would like to ask of the people who collected the data? 
+
+> It would be important to consider the demographics of the people collected, especially because what country they're from is a predictor. Because we're only considering the 5 most common countries and all others are lumped together, the information could be skewed enough that people from certain countries are targeted. I think it's also concerning how uneven the divide of data between the two hotels was - about 2/3 came from the city hotel, meaning it and its guests were overrepresented. I'd be curious to ask how those two hotels in particular were chosen to be part of the dataset, whether there were any differences in summer as opposed to other seasons (because summer months were overrepresented), and if there were any variables they considered including but didn't.
+
+
+
+## Bias and Fairness
+
+Read [Chapter 1: The Power Chapter](https://data-feminism.mitpress.mit.edu/pub/vi8obxh7/release/4) of Data Feminism by Catherine D'Ignazio and Lauren Klein. Write a 4-6 sentence paragraph reflecting on this chapter. As you reflect, you might consider responding to these specific questions. We will also have a discussion about these questions in class on Thursday.
+
+* At the end of the "Matrix of Domination" section, they encourage us to "ask uncomfortable questions: who is doing the work of data science (and who is not)? Whose goals are prioritized in data science (and whose are not)? And who benefits from data science (and who is either overlooked or actively harmed)?" In general, how would you answer these questions? And why are they important?  
+* Can you think of any examples of missing datasets, like those described in the "Data Science for Whom?" section? Or was there an example there that surprised you?  
+* How did the examples in the "Data Science with Whose Interests and Goals?" section make you feel? What responsibility do companies have to prevent these things from occurring? Who is to blame?
+
+> As the article mentions, the answer to the question of "who is doing the work of data science?" is, in an official capacity, overwhelmingly white men. However, the article also gave several examples of people who I consider to be doing the "real" work of data science, people who, rather than working at large companies that generally violate consumer privacy, are advocating for changes in the way data is collected and analyzed. The article gave numerous examples of how data science actively harms certain groups, from AI facial recognition software being used in surveillance states to poor parents being more likely to be accused of child abuse because of their class. In some cases, less biased data collection can help to solve these problems, but in others (especially the facial recognition softwares and others that infringe on privacy) we must consider whether such analysis should be done at all.
+
+
